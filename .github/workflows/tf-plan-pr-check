@@ -1,0 +1,97 @@
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [opened, reopened]
+    paths-ignore:
+      - ‘**.github/**’
+jobs:
+    detect-changed-files:
+      runs-on: ubuntu-latest
+      steps:
+        - uses: actions/checkout@v2
+          with:
+            fetch-depth: 0  # OR “2” -> To retrieve the preceding commit.
+        - name: Get changed files
+          id: changed-files
+          uses: tj-actions/changed-files@v14.4
+          with:
+            files: |
+              **/*.tfvars
+              *.hcl
+              !*.yml
+              !*.yaml
+              !*wintel/security_groups/bi*
+              !*services/bi*
+        - name: Extract paths for terraform plan
+          id: extract-tf-path
+          if: steps.changed-files.outputs.any_changed == ‘true’
+          run: |
+            for file in ${{ steps.changed-files.outputs.all_modified_files }}; do
+              file_ext=${file#*.*}
+              tfPath=“$(echo “${file%/*}/“)”
+              echo “$file was modified”
+              echo “$file_ext file extension stored”
+              echo $file_ext “is a terraform hcl or tfvars file”
+              echo “terraform path is $tfPath”
+              echo $tfPath >> paths.txt
+              echo “#########tf-paths#######”
+              cat paths.txt
+              echo “#########tf-paths#######”
+            done
+        - name: Upload Paths Artifact
+          uses: actions/upload-artifact@v2
+          with:
+            name: paths-artifact
+            path: paths.txt
+            retention-days: 1
+    terraform_plan:
+          runs-on: ubuntu-latest
+          needs: detect-changed-files
+          steps:
+            - name: Checkout
+              uses: actions/checkout@1.0.0
+            - name: Setup AWS credentials
+              uses: aws-actions/configure-aws-credentials@v1
+              with:
+                aws-access-key-id: ${{secrets.AWS_BILLING_JENKINS_ACCESS_KEY}} #billing account
+                aws-secret-access-key: ${{secrets.AWS_BILLING_JENKINS_SECRET_ACCESS_KEY}}
+                aws-region: ${{secrets.AWS_DEFAULT_REGION}} #can be an input
+                role-duration-seconds: 3600
+                role-session-name: ReconfigureAWSCredSession
+            - name: Setup Terragrunt
+              uses: autero1/action-terragrunt@v1.0.0
+              with:
+                terragrunt_version: ‘0.18.7’
+            - name: Setup Terraform
+              uses: hashicorp/setup-terraform@v1
+              with:
+                terraform_version: ‘0.11.15’
+                terraform_wrapper: false
+            - name: Set up github private access
+              run: |
+                git config --global url.“https://${GH_PACKAGES_USERNAME}:${GH_PACKAGES_TOKEN}@github.com/matchesfashion”.insteadOf “https://github.com/matchesfashion”
+                git config --add --global url.“https://${GH_PACKAGES_USERNAME}:${GH_PACKAGES_TOKEN}@github.com/matchesfashion”.insteadOf “ssh://git@github.com/matchesfashion”
+              env:
+                GH_PACKAGES_USERNAME: ${{ secrets.GH_PACKAGES_USERNAME }}
+                GH_PACKAGES_TOKEN: ${{ secrets.GH_PACKAGES_TOKEN }}
+            - name: Download Path Artifact
+              uses: actions/download-artifact@v2
+              with:
+                name: paths-artifact
+            - name: AWS Terragrunt Plan
+              shell: bash
+              run: |
+                while read paths; do
+                  terragrunt plan --terragrunt-working-dir $paths -out=plan.data -input=false --terragrunt-non-interactive
+                done <paths.txt
+            - name: Generate Terraform annotations
+              uses: ./.github/actions/terraform-annotate
+              with:
+                assume_role: ${{ env.TERRAGRUNT_IAM_ROLE }}
+                output_file: ‘annotations.json’
+            - name: Attach annotations
+              uses: yuzutech/annotations-action@v0.2.1
+              with:
+                repo-token: ${{ secrets.GITHUB_TOKEN }}
+                title: ‘output’
+                input: ‘annotations.json’
